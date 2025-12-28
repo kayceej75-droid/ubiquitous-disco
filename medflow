@@ -1,0 +1,450 @@
+hospital_followup_ai/
+│
+├── app/
+│   ├── main.py
+│   ├── database.py
+│   ├── models.py
+│   ├── rules.py
+│   ├── sms.py
+│   ├── scheduler.py
+│   └── routes.py
+│
+├── requirements.txt
+└── README.md
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+apscheduler
+requests
+python-dotenv
+pip install -r requirements.txt
+├── database.py
+│   ├── from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+DATABASE_URL = "sqlite:///./hospital.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+├── models.py
+│   ├── from sqlalchemy import Column, Integer, String, Date
+from database import Base
+
+class Patient(Base):
+    __tablename__ = "patients"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    phone = Column(String)
+    diagnosis = Column(String)
+    discharge_date = Column(Date)
+    follow_up_date = Column(Date)
+    risk = Column(String, default="GREEN")
+from sqlalchemy import Column, Integer, String, Date, Boolean
+
+class Patient(Base):
+    __tablename__ = "patients"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    phone = Column(String)
+    diagnosis = Column(String)
+    discharge_date = Column(Date)
+    follow_up_date = Column(Date)
+    risk = Column(String, default="GREEN")
+    needs_attention = Column(Boolean, default=False)
+from sqlalchemy import Column, Integer, String, Date, Boolean
+
+class Patient(Base):
+    __tablename__ = "patients"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    phone = Column(String)
+    diagnosis = Column(String)   # HIV, TB, ANC, PNC, etc
+    program = Column(String)     # HIV, TB, MATERNITY
+    discharge_date = Column(Date, nullable=True)
+    follow_up_date = Column(Date)
+    last_lab_date = Column(Date, nullable=True)
+    risk = Column(String, default="GREEN")
+    needs_attention = Column(Boolean, default=False)
+from sqlalchemy import Column, Integer, String, Date, Boolean, ForeignKey
+from database import Base
+
+class CHW(Base):
+    __tablename__ = "chws"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    phone = Column(String)
+    area = Column(String)
+
+class CHWTask(Base):
+    __tablename__ = "chw_tasks"
+
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"))
+    chw_id = Column(Integer, ForeignKey("chws.id"))
+    status = Column(String, default="PENDING")  # PENDING, COMPLETED
+    notes = Column(String, nullable=True)
+
+├── rules.py
+│   ├──from datetime import date
+
+def evaluate_patient(patient):
+    today = date.today()
+
+    if today > patient.follow_up_date:
+        patient.risk = "RED"
+        return "MISSED_FOLLOWUP"
+
+    if (patient.follow_up_date - today).days == 1:
+        return "REMINDER"
+
+    if (today - patient.discharge_date).days == 2:
+        return "CHECKIN"
+from datetime import date
+
+def evaluate_patient(patient):
+    today = date.today()
+
+    # =========================
+    # HIV FOLLOW-UP RULES
+    # =========================
+    if patient.program == "HIV":
+        if patient.last_lab_date:
+            if (today - patient.last_lab_date).days >= 180:
+                return "HIV_LAB_REMINDER"
+
+        if today > patient.follow_up_date:
+            patient.risk = "RED"
+            patient.needs_attention = True
+            return "HIV_MISSED_VISIT"
+
+    # =========================
+    # TB FOLLOW-UP RULES
+    # =========================
+    if patient.program == "TB":
+        if today > patient.follow_up_date:
+            patient.risk = "RED"
+            patient.needs_attention = True
+            return "TB_MISSED_VISIT"
+
+        if (patient.follow_up_date - today).days == 1:
+            return "TB_VISIT_REMINDER"
+
+    # =========================
+    # MATERNITY (ANC / PNC)
+    # =========================
+    if patient.program == "MATERNITY":
+        if (patient.follow_up_date - today).days == 1:
+            return "MATERNITY_REMINDER"
+
+        if today > patient.follow_up_date:
+            patient.risk = "RED"
+            patient.needs_attention = True
+            return "MATERNITY_MISSED_VISIT"
+
+    return None
+
+├── sms.py
+│   ├── import requests
+
+API_KEY = "YOUR_API_KEY"
+USERNAME = "sandbox"
+SENDER_ID = "Hospital"
+
+def send_sms(phone, message):
+    url = "https://api.africastalking.com/version1/messaging"
+    headers = {
+        "apikey": API_KEY,
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    data = {
+        "username": USERNAME,
+        "to": phone,
+        "message": message,
+        "from": SENDER_ID
+    }
+    requests.post(url, headers=headers, data=data)
+│   ├── routes.py
+from fastapi import APIRouter, Request
+from database import SessionLocal
+from models import Patient
+from sms import send_sms
+
+router = APIRouter()
+
+@router.post("/sms-reply")
+async def receive_sms(request: Request):
+    data = await request.form()
+    phone = data.get("from")
+    text = data.get("text")
+
+    db = SessionLocal()
+    patient = db.query(Patient).filter(Patient.phone == phone).first()
+
+    if patient:
+        if text.strip() == "2":
+            patient.risk = "RED"
+            patient.needs_attention = True
+            send_sms(
+                phone,
+                "Asante. Muuguzi atawasiliana nawe muda mfupi."
+            )
+
+    db.commit()
+    db.close()
+    return {"status": "received"}
+├── scheduler.py
+│   ├── from apscheduler.schedulers.background import BackgroundScheduler
+from database import SessionLocal
+from models import Patient
+from rules import evaluate_patient
+from sms import send_sms
+
+def run_followups():
+    db = SessionLocal()
+    patients = db.query(Patient).all()
+
+    for patient in patients:
+        action = evaluate_patient(patient)
+
+        if action == "CHECKIN":
+            send_sms(patient.phone,
+                "Habari, unaendelea vizuri baada ya kuruhusiwa? Jibu 1=Niko sawa, 2=Nahisi vibaya")
+
+        if action == "REMINDER":
+            send_sms(patient.phone,
+                "Kumbuka miadi yako ya hospitali kesho.")
+
+        if action == "MISSED_FOLLOWUP":
+            patient.risk = "RED"
+
+    db.commit()
+    db.close()
+
+def start_scheduler():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(run_followups, "interval", hours=24)
+    scheduler.start()
+from sms import send_sms
+
+def handle_action(patient, action):
+    if action == "HIV_LAB_REMINDER":
+        send_sms(
+            patient.phone,
+            "Habari, ni muda wa kufika kliniki kwa vipimo vya kawaida. Tafadhali fika hospitalini."
+        )
+
+    elif action == "HIV_MISSED_VISIT":
+        send_sms(
+            patient.phone,
+            "Ulikosa miadi yako ya kliniki. Tafadhali wasiliana na kituo cha afya."
+        )
+
+    elif action == "TB_VISIT_REMINDER":
+        send_sms(
+            patient.phone,
+            "Kumbuka miadi yako ya kliniki kesho. Afya yako ni muhimu."
+        )
+
+    elif action == "TB_MISSED_VISIT":
+        send_sms(
+            patient.phone,
+            "Hatukuona katika miadi yako. Tafadhali fika hospitalini haraka iwezekanavyo."
+        )
+
+    elif action == "MATERNITY_REMINDER":
+        send_sms(
+            patient.phone,
+            "Kumbuka miadi yako ya mama na mtoto kesho. Karibu hospitalini."
+        )
+
+    elif action == "MATERNITY_MISSED_VISIT":
+        send_sms(
+            patient.phone,
+            "Ulikosa miadi yako ya kliniki ya mama na mtoto. Tafadhali fika hospitalini."
+        )
+from models import Patient, CHW, CHWTask
+
+def assign_chw_tasks(db):
+    red_patients = db.query(Patient).filter(
+        Patient.risk == "RED",
+        Patient.needs_attention == True
+    ).all()
+
+    chws = db.query(CHW).all()
+    if not chws:
+        return
+
+    for i, patient in enumerate(red_patients):
+        assigned_chw = chws[i % len(chws)]
+
+        task_exists = db.query(CHWTask).filter(
+            CHWTask.patient_id == patient.id
+        ).first()
+
+        if not task_exists:
+            task = CHWTask(
+                patient_id=patient.id,
+                chw_id=assigned_chw.id
+            )
+            db.add(task)
+from sms import send_sms
+
+def notify_chw(chw, patient):
+    send_sms(
+        chw.phone,
+        f"CHW TASK: Tembelea mgonjwa {patient.name}, Simu: {patient.phone}"
+    )
+notify_chw(assigned_chw, patient)
+
+├── main.py
+│   ├── from fastapi import FastAPI
+from database import Base, engine
+from scheduler import start_scheduler
+
+app = FastAPI()
+
+Base.metadata.create_all(bind=engine)
+
+@app.on_event("startup")
+def startup():
+    start_scheduler()
+
+@app.get("/")
+def root():
+from routes import router
+app.include_router(router)
+    return {"status": "AI Follow-Up System Running"}
+uvicorn app.main:app --reload
+from fastapi.responses import HTMLResponse
+from database import SessionLocal
+from models import Patient
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    db = SessionLocal()
+    patients = db.query(Patient).all()
+    db.close()
+
+    rows = ""
+    for p in patients:
+        color = "red" if p.risk == "RED" else "green"
+        rows += f"""
+        <tr>
+            <td>{p.name}</td>
+            <td>{p.phone}</td>
+            <td>{p.diagnosis}</td>
+            <td style='color:{color}'>{p.risk}</td>
+        </tr>
+        """
+
+    return f"""
+    <html>
+    <head><title>Follow-Up Dashboard</title></head>
+    <body>
+        <h2>Patients Needing Follow-Up</h2>
+        <table border="1" cellpadding="5">
+            <tr>
+                <th>Name</th>
+                <th>Phone</th>
+                <th>Diagnosis</th>
+                <th>Risk</th>
+            </tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """
+pip install pandas openpyxl
+import pandas as pd
+from datetime import datetime
+from database import SessionLocal
+from models import Patient
+
+df = pd.read_excel("patients.xlsx")
+
+db = SessionLocal()
+
+for _, row in df.iterrows():
+    patient = Patient(
+        name=row["name"],
+        phone=row["phone"],
+        diagnosis=row["diagnosis"],
+        discharge_date=row["discharge_date"],
+        follow_up_date=row["follow_up_date"]
+    )
+    db.add(patient)
+
+db.commit()
+db.close()
+from fastapi.responses import HTMLResponse
+from models import CHWTask, Patient, CHW
+from database import SessionLocal
+
+@app.get("/chw-dashboard", response_class=HTMLResponse)
+def chw_dashboard():
+    db = SessionLocal()
+    tasks = db.query(CHWTask).filter(
+        CHWTask.status == "PENDING"
+    ).all()
+
+    rows = ""
+    for task in tasks:
+        patient = db.query(Patient).get(task.patient_id)
+        chw = db.query(CHW).get(task.chw_id)
+
+        rows += f"""
+        <tr>
+            <td>{chw.name}</td>
+            <td>{patient.name}</td>
+            <td>{patient.phone}</td>
+            <td>{patient.diagnosis}</td>
+        </tr>
+        """
+
+    db.close()
+
+    return f"""
+    <html>
+    <body>
+        <h2>CHW Follow-Up Tasks</h2>
+        <table border="1">
+            <tr>
+                <th>CHW</th>
+                <th>Patient</th>
+                <th>Phone</th>
+                <th>Condition</th>
+            </tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """
+
+print("Patients imported successfully")
+action = evaluate_patient(patient)
+if action:
+    handle_action(patient, action)
+assign_chw_tasks(db)
+from fastapi import Form
+
+@app.post("/chw-report")
+def chw_report(task_id: int = Form(...), notes: str = Form(...)):
+    db = SessionLocal()
+    task = db.query(CHWTask).get(task_id)
+    patient = db.query(Patient).get(task.patient_id)
+
+    task.status = "COMPLETED"
+    task.notes = notes
+    patient.needs_attention = False
+    patient.risk = "GREEN"
+
+    db.commit()
+    db.close()
+    return {"status": "Report submitted"}
+
